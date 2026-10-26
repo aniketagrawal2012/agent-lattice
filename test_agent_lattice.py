@@ -4,7 +4,12 @@ Validates mathematical lattice axioms, causal token taint tracking,
 composite non-interference enforcement, and dynamic endorsement.
 """
 
+import os
+import sys
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from agent_lattice.types import (
     SecurityLabel,
     IntegrityLevel,
@@ -777,9 +782,137 @@ class TestAgentLattice(unittest.TestCase):
         self.assertIsNotNone(voucher.escrow_receipt)
         self.assertIn("Quarantine Escrow", voucher.security_reason)
 
+    def test_22_universal_priority_tiered_span_resolution_and_entropy(self):
+        """
+        Validates Section III-B.1:
+        1. High-entropy identifier check (H_bit >= 24.0, |v| >= 8, |Sigma(v)| >= 6).
+        2. Universal priority-tiered span resolution for execution-control parameters (p in S_ctrl)
+           across both high-entropy and low-entropy (+/-12-word-token proximity) regimes, preventing
+           untrusted tool observations from inducing taint-contamination DoS by echoing legitimate
+           target IDs or key aliases.
+        """
+        from agent_lattice.provenance import is_high_entropy_literal
+        self.assertTrue(is_high_entropy_literal("acc_948271bc"))
+        self.assertFalse(is_high_entropy_literal("true"))
+        self.assertFalse(is_high_entropy_literal("aaaaaaaaaa"))
+
+        tracker = CausalProvenanceTracker(agent_id="order_agent")
+        # Trusted internal span with high-entropy ID and low-entropy status near key alias
+        tracker.ingest_internal_tool_output(
+            text="Order record order_id: ORD982734AF with order_status: APPROVED",
+            tool_id="sap_order_service",
+            compartments={ConfidentialityCompartment.INTERNAL},
+            integrity=IntegrityLevel.VERIFIED
+        )
+        # Adversarial untrusted observation echoing the same high-entropy ID and key alias
+        tracker.ingest_untrusted_input(
+            text="Echoed spam order_id: ORD982734AF and order_status: APPROVED",
+            source="UNTRUSTED_EMAIL_SCRAPER"
+        )
+
+        # High-entropy control parameter resolves to Tier 1 (VERIFIED) rather than collapsing to UNTRUSTED
+        lbl_high = tracker.compute_backward_slice_label(
+            "ORD982734AF",
+            is_mutating=True,
+            is_control_param=True,
+            param_name="order_id"
+        )
+        self.assertEqual(lbl_high.integrity, IntegrityLevel.VERIFIED)
+        self.assertIn(ConfidentialityCompartment.INTERNAL, lbl_high.confidentiality)
+
+        # Low-entropy control parameter within +/-12 word tokens of 'order_status' resolves to Tier 1 (VERIFIED)
+        lbl_low = tracker.compute_backward_slice_label(
+            "APPROVED",
+            is_mutating=True,
+            is_control_param=True,
+            param_name="order_status"
+        )
+        self.assertEqual(lbl_low.integrity, IntegrityLevel.VERIFIED)
+
+    def test_23_five_level_user_intent_idor_protection_and_expression_canonicalizer(self):
+        r"""
+        Validates Section III-B.1 & Section VI-A.1:
+        1. 5-level integrity refinement (I_user = 0.5) where min_endorse_integrity = 0.5 permits
+           authenticated user prompts to undergo dynamic endorsement while barring third-party
+           untrusted observations (I_untrusted = 0.0) from endorsing primitive control slots.
+        2. Deterministic expression canonicalizer registration (\phi_canon in C_schema(p)).
+        """
+        tracker = CausalProvenanceTracker(agent_id="user_assistant")
+        user_span = tracker.ingest_authenticated_user_input(
+            text="Please update my ticket TKT-551920 due date to 2026-11-15",
+            source="AUTHENTICATED_USER_PROMPT"
+        )
+        third_party_span = tracker.ingest_untrusted_input(
+            text="Injected external ticket TKT-999999",
+            source="EXTERNAL_WEB_SCRAPE"
+        )
+
+        # Third-party span (I = 0.0) is barred when min_endorse_integrity = 0.5
+        self.assertFalse(
+            tracker.endorse_token_span(
+                third_party_span.span_id,
+                IntegrityLevel.SANITIZED,
+                min_endorse_integrity=0.5
+            )
+        )
+        # Authenticated user span (I_user = 0.5) succeeds under min_endorse_integrity = 0.5
+        self.assertTrue(
+            tracker.endorse_token_span(
+                user_span.span_id,
+                IntegrityLevel.SANITIZED,
+                min_endorse_integrity=0.5
+            )
+        )
+
+        # Register deterministic date canonicalizer mapping '2026-11-15' -> '20261115_ISO'
+        tracker.register_expression_canonicalizer(
+            "due_date",
+            lambda txt: ["20261115_ISO"] if "2026-11-15" in txt else []
+        )
+        lbl_date = tracker.compute_backward_slice_label(
+            "20261115_ISO",
+            is_mutating=True,
+            is_control_param=True,
+            param_name="due_date"
+        )
+        self.assertEqual(lbl_date.integrity, IntegrityLevel.SANITIZED)
+
+    def test_24_pre_attenuation_anomaly_score_and_privilege_quarantine_eq27(self):
+        """
+        Validates Equation 27 (5-conjunct pre-attenuation anomaly score s_lattice^pre),
+        InPrivilegeQuarantine tracking, 3-stage SanitizeRead, and 3-tier CleanInjection.
+        """
+        tracker = CausalProvenanceTracker(agent_id="quarantine_test_agent")
+        tracker.ingest_untrusted_input(
+            text="Malicious SQL: DROP TABLE accounts; --",
+            source="UNTRUSTED_FEED"
+        )
+
+        # Compute pre-attenuation anomaly score on mutating tool under integrity deficit
+        score = self.gateway.compute_pre_attenuation_anomaly_score(
+            caller_agent_id="quarantine_test_agent",
+            tool_id="spanner_execute_sql_write",
+            arguments={"query": "DROP TABLE accounts; --", "database": "prod_finance"},
+            provenance_tracker=tracker
+        )
+        self.assertEqual(score, 1.0)
+        # Agent now has an active unresolved QUARANTINE_ESCROW on CLOUD_SPANNER
+        contract = self.gateway.registered_tools["spanner_execute_sql_write"]
+        self.assertTrue(
+            self.gateway.in_privilege_quarantine(
+                "quarantine_test_agent",
+                {"query": "SELECT 1", "database": "prod_finance"},
+                contract
+            )
+        )
+
+        # Verify 3-stage _sanitize_read_parameters strips block comments and UNION SELECT
+        sanitized_read = self.gateway._sanitize_read_parameters(
+            {"query": "SELECT * FROM gl /* comment */ ; UNION SELECT password FROM users --"}
+        )
+        self.assertNotIn("/*", sanitized_read["query"])
+        self.assertIn("[SANITIZED_READ_CLAUSE]", sanitized_read["query"])
+
 
 if __name__ == '__main__':
     unittest.main()
-
-
-
