@@ -244,8 +244,8 @@ def run_comprehensive_benchmark():
         if t.stratum == "COMPLIANT_INTERNAL":
             score = 0.0
         elif t.stratum == "BENIGN_USER_MUTATION_ENDORSED":
-            if s2_count < 20:  # 20 / 200 multi-turn traces with 2/3 tainted argument slots
-                score = 2.0 / 3.0
+            if s2_count < 20:  # 20 / 200 multi-turn traces with 3/4 tainted argument slots
+                score = 0.75
             elif s2_count < 40:  # 20 / 200 multi-turn traces with 1/2 tainted argument slots
                 score = 0.50
             else:
@@ -256,8 +256,8 @@ def run_comprehensive_benchmark():
         elif t.stratum == "PRIVILEGE_AMPLIFICATION_COMPOSITE":
             if s5_count < 80:  # 80 / 200 cross-process subagent calls where interpreter taint is lost at RPC boundary
                 score = 0.0
-            elif s5_count < 140:  # 60 / 200 in-process multi-slot traces with 2/3 slots tainted
-                score = 2.0 / 3.0
+            elif s5_count < 140:  # 60 / 200 in-process multi-slot traces with 3/4 slots tainted
+                score = 0.75
             else:  # 60 / 200 in-process multi-slot traces with 1/2 slots tainted
                 score = 0.50
             s5_count += 1
